@@ -252,6 +252,20 @@ def request_body(kwargs):
     return encoded, manifest, names
 
 
+def host_tool_name(returned, names):
+    """Decode an exact advertised host name, with or without its MCP envelope."""
+    if isinstance(returned, str):
+        if returned.startswith(PREFIX) and returned[len(PREFIX):] in names:
+            return returned[len(PREFIX):]
+        if returned in names:
+            return returned
+    # Name-only diagnostics identify protocol drift without logging arguments,
+    # prompts, results, credentials or the full tool inventory.
+    label = re.sub(r'[^A-Za-z0-9_-]', '?', str(returned))[:80]
+    raise RuntimeError(f'Native returned a tool outside the current host inventory '
+                       f'(name={label}, advertised_count={len(names)})')
+
+
 class Request:
     def __init__(self, client):
         self.client, self.process = client, None
@@ -595,10 +609,8 @@ class Client:
                 calls = []
                 for block in blocks:
                     if block.get('type') == 'tool_use':
-                        name = block['name']
-                        if not name.startswith(PREFIX) or name[len(PREFIX):] not in names:
-                            raise RuntimeError('Native returned a tool outside the current host inventory')
-                        calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name[len(PREFIX):], 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
+                        name = host_tool_name(block['name'], names)
+                        calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
                 boundary = bool(calls) and final.get('subtype') == 'error_max_turns' and p.returncode == 1
                 if not boundary and not native_failure_handled and (p.returncode != 0 or final.get('is_error') or final.get('subtype') != 'success'):
                     raise RuntimeError('Native request failed: ' + str(final.get('subtype')))
