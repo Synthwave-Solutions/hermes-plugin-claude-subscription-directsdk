@@ -1,4 +1,4 @@
-"""Decode only exact currently advertised names; never recover unknown tools."""
+"""Decode exact advertised names; pass other nonempty names to the host so it can answer them."""
 import pytest
 import sys
 from pathlib import Path
@@ -9,14 +9,24 @@ import directsdk
 def test_exact_current_tool_name(returned,expected):
     assert directsdk.host_tool_name(returned, {'read_file'}) == expected
 
-@pytest.mark.parametrize('returned', ['old_tool','mcp__hermes__old_tool','mcp__other__read_file','Read_File','mcp__hermes__mcp__hermes__read_file'])
-def test_unknown_or_historical_tool_is_rejected(returned):
+@pytest.mark.parametrize('returned,expected', [
+    ('old_tool', 'old_tool'),
+    ('mcp__hermes__old_tool', 'old_tool'),
+    ('mcp__hermes__computer_use', 'computer_use'),
+    ('mcp__other__read_file', 'mcp__other__read_file'),
+    ('Read_File', 'Read_File'),
+    ('mcp__hermes__mcp__hermes__read_file', 'mcp__hermes__read_file'),
+])
+def test_unknown_tool_is_passed_to_host(returned, expected):
+    assert directsdk.host_tool_name(returned, {'read_file'}) == expected
+
+def test_empty_inventory_passes_name_through():
+    assert directsdk.host_tool_name('read_file', set()) == 'read_file'
+
+@pytest.mark.parametrize('returned', ['', '   ', 'mcp__hermes__', None, 42])
+def test_empty_or_non_string_name_is_rejected(returned):
     with pytest.raises(RuntimeError, match='outside the current host inventory'):
         directsdk.host_tool_name(returned, {'read_file'})
-
-def test_empty_inventory_rejects_every_tool():
-    with pytest.raises(RuntimeError):
-        directsdk.host_tool_name('read_file', set())
 
 def test_canonical_prefix_takes_precedence():
     assert directsdk.host_tool_name('mcp__hermes__read_file', {'read_file','mcp__hermes__read_file'}) == 'read_file'

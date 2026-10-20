@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -253,7 +254,12 @@ def request_body(kwargs):
 
 
 def host_tool_name(returned, names):
-    """Decode an exact advertised host name, with or without its MCP envelope."""
+    """Decode an exact advertised host name, with or without its MCP envelope.
+
+    SYNTHWAVE: a nonempty name outside the inventory (a deferred tool the model
+    called directly after tool_describe) is passed through without the envelope,
+    so the host answers it with a tool error the model can correct. Failing the
+    whole request here ended the turn with only the announcement text."""
     if isinstance(returned, str):
         if returned.startswith(PREFIX) and returned[len(PREFIX):] in names:
             return returned[len(PREFIX):]
@@ -262,6 +268,12 @@ def host_tool_name(returned, names):
     # Name-only diagnostics identify protocol drift without logging arguments,
     # prompts, results, credentials or the full tool inventory.
     label = re.sub(r'[^A-Za-z0-9_-]', '?', str(returned))[:80]
+    bare = returned[len(PREFIX):] if isinstance(returned, str) and returned.startswith(PREFIX) else returned
+    if isinstance(bare, str) and bare.strip():
+        logging.getLogger(__name__).warning(
+            'Native returned a tool outside the current host inventory; passing it to the host '
+            '(name=%s, advertised_count=%d)', label, len(names))
+        return bare
     raise RuntimeError(f'Native returned a tool outside the current host inventory '
                        f'(name={label}, advertised_count={len(names)})')
 
