@@ -211,3 +211,22 @@ The subscription-backed task, CLI delegation, streaming, resume, denial, steerin
 Extracted from hermes-agent PR #105863 (`feat: add Claude Subscription DirectSDK (Experimental) provider`) by @teknium1 and @unsupportedpastels. The provider-agnostic parts of that PR (external-process provider profiles, provider-native replay carriers, setup-flow gating, picker plumbing) land in Hermes core via hermes-agent PR #117451; the provider itself lives here as a standalone plugin because Hermes does not bundle vendor-specific subscription transports in-tree. The `claude` presence checks were added during extraction.
 
 MIT licensed; see `LICENSE`.
+
+### Request transport latency
+
+The relay preconnects while the native CLI prepares its request. This is a
+request-owned TCP/TLS connection, not a model call or cross-account connection
+pool. Cancellation closes unused connections; connections older than five
+seconds are refreshed before submission. Setup uses a ten-second connect budget.
+`HERMES_DIRECTSDK_PRECONNECT=0` restores serial connection setup.
+
+Large requests (at least 32 KiB) to `https://api.anthropic.com` use lossless gzip
+level 1 only when it reduces the body size. Other upstreams are unchanged.
+`HERMES_DIRECTSDK_GZIP=0` disables it. Responses remain uncompressed and flush
+as each chunk arrives. Native gzip input is decoded before existing context/cache
+processing, with a 32 MiB decompressed-body limit. No context or tools are removed.
+
+The `transport_metrics` log contains only byte counts and timings: native
+preparation, connection/wait, compression, send, response headers, first byte,
+and first meaningful text/thinking/tool-input output. Pings do not count as
+model output. No prompts, authentication headers, or request URLs are logged.

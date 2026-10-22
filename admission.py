@@ -1,6 +1,7 @@
 """Request-scoped native HTTP admission; credentials are forwarded, never persisted."""
 import base64
 import codecs
+import time
 import copy
 import http.client
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -15,6 +16,12 @@ import ssl
 import threading
 from urllib.parse import unquote, urlsplit
 import urllib.request
+
+
+try:
+    from .transport_speed import PreparedConnection, decode_request, encode_request, enabled
+except ImportError:
+    from transport_speed import PreparedConnection, decode_request, encode_request, enabled
 
 
 UNCACHEABLE = ('thinking', 'redacted_thinking')
@@ -275,6 +282,7 @@ class Capture:
         self.message = None
         self.complete = False
         self.pending = ''
+        self.first_output_at = None
         self.decoder = codecs.getincrementaldecoder('utf-8')()
         self.arguments = {}
 
@@ -287,6 +295,13 @@ class Capture:
                 self.event(json.loads(data))
 
     def event(self, event):
+        delta = event.get('delta', {})
+        block = event.get('content_block', {})
+        if self.first_output_at is None and (
+            any(delta.get(k) for k in ('text', 'thinking', 'partial_json'))
+            or any(block.get(k) for k in ('text', 'thinking'))
+        ):
+            self.first_output_at = time.perf_counter()
         handler = {
             'message_start': self._start,
             'content_block_start': self._block_start,
@@ -398,6 +413,24 @@ class Admission:
         self.url = f'http://127.0.0.1:{self.server.server_port}' + self.prefix
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval':.05}, daemon=True)
         self.thread.start()
+        self.created_at = time.perf_counter()
+        self.transport_metrics = {}
+        self.gzip_requests = (self.upstream.scheme == 'https' and self.upstream.hostname == 'api.anthropic.com'
+                              and enabled('HERMES_DIRECTSDK_GZIP'))
+        self.prepared = PreparedConnection(self._connection) if enabled('HERMES_DIRECTSDK_PRECONNECT') else None
+
+    def _connection(self):
+        target = self.upstream
+        if target.scheme == 'https':
+            if self.proxy:
+                proxy_host, proxy_port, tunnel_headers = self.proxy
+                conn = http.client.HTTPSConnection(proxy_host, proxy_port, timeout=min(self.timeout, 10), context=ssl.create_default_context())
+                conn.set_tunnel(target.hostname, target.port or 443, headers=tunnel_headers)
+            else:
+                conn = http.client.HTTPSConnection(target.hostname, target.port, timeout=min(self.timeout, 10), context=ssl.create_default_context())
+        else:
+            conn = http.client.HTTPConnection(target.hostname, target.port, timeout=min(self.timeout, 10))
+        return conn
 
     def error_text(self):
         """The upstream's own message for a non-200 answer, '' when none was captured."""
@@ -409,6 +442,8 @@ class Admission:
         return message if isinstance(message, str) else text
 
     def abort(self):
+        if self.prepared is not None:
+            self.prepared.close()
         with self.lock:
             self.cancelled = True
             for sock in self.sockets:
@@ -458,7 +493,13 @@ class Handler(BaseHTTPRequestHandler):
         upstream_socket = None
         try:
             self.connection.settimeout(gate.timeout)
-            payload = self.rfile.read(int(self.headers['Content-Length']))
+            request_started = time.perf_counter()
+            gate.transport_metrics["native_prepare_ms"] = (request_started - gate.created_at) * 1000
+            length = int(self.headers['Content-Length'])
+            if not 0 <= length <= 32 * 1024 * 1024:
+                raise ValueError('request body too large')
+            payload = self.rfile.read(length)
+            payload = decode_request(payload, self.headers.get('Content-Encoding'))
             try:
                 payload = restore_queried_turn(payload, gate.queried)
             except QueriedTurnMismatch as exc:
@@ -468,16 +509,16 @@ class Handler(BaseHTTPRequestHandler):
                 gate.unrestored = str(exc)
             payload = pin_message_breakpoint(payload, gate.queried)
             target = gate.upstream
-            if target.scheme == 'https':
-                if gate.proxy:
-                    proxy_host, proxy_port, tunnel_headers = gate.proxy
-                    conn = http.client.HTTPSConnection(proxy_host, proxy_port, timeout=gate.timeout, context=ssl.create_default_context())
-                    conn.set_tunnel(target.hostname, target.port or 443, headers=tunnel_headers)
-                else:
-                    conn = http.client.HTTPSConnection(target.hostname, target.port, timeout=gate.timeout, context=ssl.create_default_context())
+            wait_started = time.perf_counter()
+            if gate.prepared is not None:
+                conn = gate.prepared.take(min(gate.timeout, 10) + 1)
+                gate.transport_metrics['connect_ms'] = gate.prepared.connect_ms
             else:
-                conn = http.client.HTTPConnection(target.hostname, target.port, timeout=gate.timeout)
-            conn.connect()
+                conn = gate._connection()
+                conn.connect()
+                gate.transport_metrics['connect_ms'] = (time.perf_counter() - wait_started) * 1000
+            gate.transport_metrics['connect_wait_ms'] = (time.perf_counter() - wait_started) * 1000
+            conn.sock.settimeout(gate.timeout)
             upstream_socket = conn.sock
             keepalive(upstream_socket)
             with gate.lock:
@@ -485,12 +526,22 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 gate.sockets.add(upstream_socket)
             # Request identity and payload remain native; only HTTP transfer encoding changes.
-            headers = {k:v for k,v in self.headers.items() if k.lower() not in ('host','connection','content-length','transfer-encoding','proxy-authorization','proxy-connection','accept-encoding')}
+            headers = {k:v for k,v in self.headers.items() if k.lower() not in ('host','connection','content-length','transfer-encoding','proxy-authorization','proxy-connection','accept-encoding','content-encoding')}
             headers['Accept-Encoding'] = 'identity'
+            gate.transport_metrics['raw_bytes'] = len(payload)
+            compress_started = time.perf_counter()
+            payload, encoding = encode_request(payload, enabled=gate.gzip_requests)
+            gate.transport_metrics['compression_ms'] = (time.perf_counter() - compress_started) * 1000
+            gate.transport_metrics['wire_bytes'] = len(payload)
+            if encoding:
+                headers['Content-Encoding'] = encoding
             route = target.path.rstrip('/') + '/v1/messages' + ('?' + path.query if path.query else '')
+            send_started = time.perf_counter()
             conn.request('POST', route, payload, headers)
+            gate.transport_metrics['send_ms'] = (time.perf_counter() - send_started) * 1000
             del headers, payload
             response = conn.getresponse()
+            gate.transport_metrics['headers_ms'] = (time.perf_counter() - request_started) * 1000
             gate.request_id = response.getheader('request-id') or response.getheader('x-request-id')
             gate.status = response.status
             self.send_response(response.status)
@@ -508,13 +559,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise UpstreamIdle(f'no upstream bytes for {idle:g} s') from exc
                 if not chunk:
                     break
+                gate.transport_metrics.setdefault('first_byte_ms', (time.perf_counter() - request_started) * 1000)
                 if response.status == 200:
                     gate.capture.feed(chunk)
+                    if gate.capture.first_output_at is not None:
+                        gate.transport_metrics.setdefault('first_output_ms', (gate.capture.first_output_at - request_started) * 1000)
                 elif len(gate.error_body) < 65536:
                     gate.error_body += chunk  # The rejection reason ("prompt is too long", "adaptive thinking is not supported"), bounded.
                 self.wfile.write(chunk)
                 self.wfile.flush()
-        except (OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError) as exc:
+        except (OSError, EOFError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError) as exc:
             gate.failure = type(exc).__name__
         finally:
             with gate.lock:
@@ -522,4 +576,5 @@ class Handler(BaseHTTPRequestHandler):
                 gate.sockets.discard(upstream_socket)
             if conn:
                 conn.close()
+            logging.getLogger(__name__).info('transport_metrics %s', json.dumps(gate.transport_metrics, sort_keys=True))
             self.close_connection = True
